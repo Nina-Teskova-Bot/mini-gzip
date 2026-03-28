@@ -219,10 +219,9 @@ fn dynamic(s: &mut State, out: &mut Vec<u8>) {
                 17 => (0, 3 + s.bits(3) as usize),
                 _ => (0, 11 + s.bits(7) as usize),
             };
-            for _ in 0..rep {
-                lengths[idx] = len;
-                idx += 1;
-            }
+            let end = idx + rep;
+            lengths[idx..end].fill(len);
+            idx = end;
         }
     }
     construct(&mut lc_cnt, &mut lc_sym, &lengths, nlen);
