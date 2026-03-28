@@ -13,7 +13,6 @@ const MAXBITS: usize = 15;
 const MAXLCODES: usize = 286;
 const MAXDCODES: usize = 30;
 const FIXLCODES: usize = 288;
-const MAXDIST: usize = 32768;
 const LENS: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -45,8 +44,6 @@ struct State<'a> {
     bit_buffer: i32,
     input: &'a [u8],
     pos: usize,
-    next: usize,
-    window: [u8; MAXDIST],
 }
 
 struct Huffman<'a> {
@@ -73,7 +70,6 @@ impl<'a> State<'a> {
         self.bit_count -= need;
         val & ((1i32 << need) - 1)
     }
-
 }
 
 fn decode(s: &mut State, h: &Huffman) -> i32 {
@@ -141,20 +137,21 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) {
     loop {
         let sym = decode(s, lc);
         if sym < 256 {
-            let c = sym as u8;
-            out.push(c);
-            s.window[s.next] = c;
-            s.next = (s.next + 1) & (MAXDIST - 1);
+            out.push(sym as u8);
         } else if sym > 256 {
             let idx = (sym - 257) as usize;
-            let len = LENS[idx] as i32 + s.bits(LEXT[idx] as i32);
+            let len = LENS[idx] as usize + s.bits(LEXT[idx] as i32) as usize;
             let dsym = decode(s, dc) as usize;
             let dist = DISTS[dsym] as usize + s.bits(DEXT[dsym] as i32) as usize;
-            for _ in 0..len {
-                let c = s.window[s.next.wrapping_sub(dist) & (MAXDIST - 1)];
-                out.push(c);
-                s.window[s.next] = c;
-                s.next = (s.next + 1) & (MAXDIST - 1);
+            assert!(dist <= out.len(), "invalid backreference distance");
+            if dist >= len {
+                let start = out.len() - dist;
+                out.extend_from_within(start..start + len);
+            } else {
+                for _ in 0..len {
+                    let c = out[out.len() - dist];
+                    out.push(c);
+                }
             }
         } else {
             return;
@@ -244,10 +241,7 @@ fn stored(s: &mut State, out: &mut Vec<u8>) {
     let len = s.bits(16) as u32;
     s.bits(16);
     for _ in 0..len {
-        let c = s.nextbyte();
-        out.push(c);
-        s.window[s.next] = c;
-        s.next = (s.next + 1) & (MAXDIST - 1);
+        out.push(s.nextbyte());
     }
 }
 
@@ -257,8 +251,6 @@ pub fn inflate(input: &[u8], output_size: usize) -> Vec<u8> {
         bit_buffer: 0,
         input,
         pos: 0,
-        next: 0,
-        window: [0; MAXDIST],
     };
     let mut out = Vec::with_capacity(output_size);
     loop {
