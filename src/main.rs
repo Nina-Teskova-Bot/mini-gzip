@@ -147,13 +147,15 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) {
             let dsym = decode(s, dc) as usize;
             let dist = DISTS[dsym] as usize + s.bits(DEXT[dsym] as i32) as usize;
             assert!(dist <= out.len(), "invalid backreference distance");
+            let start = out.len() - dist;
             if dist >= len {
-                let start = out.len() - dist;
                 out.extend_from_within(start..start + len);
             } else {
-                for _ in 0..len {
-                    let c = out[out.len() - dist];
-                    out.push(c);
+                let target_len = out.len() + len;
+                out.reserve(len);
+                while out.len() < target_len {
+                    let chunk = (out.len() - start).min(target_len - out.len());
+                    out.extend_from_within(start..start + chunk);
                 }
             }
         } else {
