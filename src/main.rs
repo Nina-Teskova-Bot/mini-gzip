@@ -36,7 +36,9 @@ const ORDER: [usize; 19] = [
 const DEFAULT_CORPUS_LIMIT: usize = 64;
 const DEFAULT_CORPUS_MAX_BYTES: u64 = 256 * 1024;
 const DEFAULT_PERF_ITERATIONS: usize = 7;
+const DEFAULT_PERF_REPEAT: usize = 5;
 const PERF_SNAPSHOT_VERSION: u64 = 1;
+const PERF_FILE_SNAPSHOT_VERSION: u64 = 1;
 const CORPUS_EXTENSIONS: &[&str] = &[
     "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "json", "lock", "md", "py",
     "rs", "sh", "toml", "ts", "txt", "yaml", "yml",
@@ -441,11 +443,19 @@ struct PerfSummary {
     bytes: usize,
 }
 
+struct SingleFileFixture {
+    source: PathBuf,
+    snapshot_root: PathBuf,
+    input: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
 fn print_usage(program: &str) {
     eprintln!(
         "usage:
   {program} [FILE]
-  {program} perf --root PATH [--iterations N] [--count N] [--max-bytes N]"
+  {program} perf --root PATH [--iterations N] [--count N] [--max-bytes N]
+  {program} perf-file --path FILE [--iterations N] [--repeat N]"
     );
 }
 
@@ -612,6 +622,128 @@ fn ensure_perf_snapshot(root: &Path, limit: usize, max_bytes: u64) -> PathBuf {
     snapshot_root
 }
 
+fn normalized_snapshot_source(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|e| panic!("current_dir: {e}"))
+            .join(path)
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or_else(|_| absolute.to_path_buf())
+}
+
+fn perf_file_snapshot_dir(source: &Path) -> PathBuf {
+    let normalized = normalized_snapshot_source(source);
+    let mut hasher = DefaultHasher::new();
+    PERF_FILE_SNAPSHOT_VERSION.hash(&mut hasher);
+    normalized.hash(&mut hasher);
+    PathBuf::from("target")
+        .join("perf-file")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+fn create_perf_file_snapshot(source: &Path, snapshot_root: &Path) {
+    assert!(source.is_file(), "{} is not a file", source.display());
+
+    let snapshot_parent = snapshot_root.parent().expect("snapshot dir parent");
+    fs::create_dir_all(snapshot_parent)
+        .unwrap_or_else(|e| panic!("create {}: {e}", snapshot_parent.display()));
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let snapshot_name = snapshot_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("snapshot dir name");
+    let temp_root =
+        snapshot_parent.join(format!(".{snapshot_name}.tmp-{}-{unique}", process::id()));
+    if temp_root.exists() {
+        remove_snapshot_root(&temp_root);
+    }
+    fs::create_dir_all(&temp_root)
+        .unwrap_or_else(|e| panic!("create {}: {e}", temp_root.display()));
+
+    let snapshot_input = temp_root.join("input");
+    fs::copy(source, &snapshot_input).unwrap_or_else(|e| {
+        panic!(
+            "copy {} -> {}: {e}",
+            source.display(),
+            snapshot_input.display()
+        )
+    });
+
+    let snapshot_gzip = temp_root.join("input.gz");
+    let compressed = gzip_via_file(&snapshot_input, &["-n", "-c"]);
+    fs::write(&snapshot_gzip, compressed)
+        .unwrap_or_else(|e| panic!("write {}: {e}", snapshot_gzip.display()));
+
+    let manifest = format!(
+        "source={}\nsource_size={}\nsource_name={}\n",
+        normalized_snapshot_source(source).display(),
+        fs::metadata(source)
+            .unwrap_or_else(|e| panic!("metadata {}: {e}", source.display()))
+            .len(),
+        source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("<unknown>"),
+    );
+    let manifest_path = temp_root.join(".manifest");
+    fs::write(&manifest_path, manifest)
+        .unwrap_or_else(|e| panic!("write {}: {e}", manifest_path.display()));
+    let complete_path = temp_root.join(".complete");
+    fs::write(&complete_path, b"")
+        .unwrap_or_else(|e| panic!("write {}: {e}", complete_path.display()));
+
+    match fs::rename(&temp_root, snapshot_root) {
+        Ok(()) => {}
+        Err(_) if perf_snapshot_complete(snapshot_root) => {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        Err(err) => panic!(
+            "rename {} -> {}: {err}",
+            temp_root.display(),
+            snapshot_root.display()
+        ),
+    }
+}
+
+fn ensure_perf_file_snapshot(source: &Path) -> PathBuf {
+    let snapshot_root = perf_file_snapshot_dir(source);
+    if perf_snapshot_complete(&snapshot_root) {
+        return snapshot_root;
+    }
+    if snapshot_root.exists() {
+        remove_snapshot_root(&snapshot_root);
+    }
+    create_perf_file_snapshot(source, &snapshot_root);
+    snapshot_root
+}
+
+fn prepare_single_file_fixture(source: &Path) -> SingleFileFixture {
+    let source = normalized_snapshot_source(source);
+    let snapshot_root = ensure_perf_file_snapshot(&source);
+    let snapshot_input = snapshot_root.join("input");
+    let snapshot_gzip = snapshot_root.join("input.gz");
+    let input = fs::read(&snapshot_input)
+        .unwrap_or_else(|e| panic!("read {}: {e}", snapshot_input.display()));
+    let compressed = fs::read(&snapshot_gzip)
+        .unwrap_or_else(|e| panic!("read {}: {e}", snapshot_gzip.display()));
+    let output = gunzip(&compressed);
+    assert_eq!(output, input, "failed for {}", source.display());
+    SingleFileFixture {
+        source,
+        snapshot_root,
+        input,
+        compressed,
+    }
+}
+
 fn prepare_corpus(root: &Path, limit: usize, max_bytes: u64) -> (Vec<CorpusEntry>, PathBuf) {
     let snapshot_root = ensure_perf_snapshot(root, limit, max_bytes);
     let paths = corpus_candidates(&snapshot_root, limit, max_bytes);
@@ -727,6 +859,73 @@ fn run_perf_harness(root: &Path, iterations: usize, limit: usize, max_bytes: u64
     );
 }
 
+fn run_single_file_perf(source: &Path, iterations: usize, repeat: usize) {
+    assert!(iterations > 0, "iterations must be greater than zero");
+    assert!(repeat > 0, "repeat must be greater than zero");
+
+    let fixture = prepare_single_file_fixture(source);
+    let source_bytes = fixture.input.len();
+    let compressed_bytes = fixture.compressed.len();
+
+    eprintln!(
+        "perf file source={} snapshot={} source_bytes={} compressed_bytes={} iterations={} repeat={}",
+        fixture.source.display(),
+        fixture.snapshot_root.display(),
+        source_bytes,
+        compressed_bytes,
+        iterations,
+        repeat
+    );
+
+    let mut runs = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let start = Instant::now();
+        let mut sink = io::sink();
+        let mut iteration_bytes = 0usize;
+        for _ in 0..repeat {
+            let output = gunzip(&fixture.compressed);
+            assert_eq!(
+                output.as_slice(),
+                fixture.input.as_slice(),
+                "failed for {}",
+                fixture.source.display()
+            );
+            sink.write_all(&output).expect("write sink");
+            iteration_bytes += output.len();
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "iteration={} elapsed_ms={:.3} bytes={} decodes={}",
+            iteration + 1,
+            elapsed_ms,
+            iteration_bytes,
+            repeat
+        );
+        runs.push(PerfRun {
+            elapsed_ms,
+            bytes: iteration_bytes,
+        });
+    }
+
+    let summary = summarize_runs(&runs, iterations);
+    println!(
+        "summary source={} snapshot={} source_bytes={} bytes={} compressed_bytes={} iterations={} repeat={} total_decodes={} total_ms={:.3} avg_ms={:.3} min_ms={:.3} median_ms={:.3} max_ms={:.3}",
+        fixture.source.display(),
+        fixture.snapshot_root.display(),
+        source_bytes,
+        summary.bytes,
+        compressed_bytes,
+        summary.iterations,
+        repeat,
+        summary.iterations * repeat,
+        summary.total_ms,
+        summary.avg_ms,
+        summary.min_ms,
+        summary.median_ms,
+        summary.max_ms
+    );
+}
+
 fn main() {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "mini-gzip".to_string());
@@ -768,13 +967,39 @@ fn main() {
         return;
     }
 
+    if cmd == "perf-file" {
+        let mut path = None::<PathBuf>;
+        let mut iterations = DEFAULT_PERF_ITERATIONS;
+        let mut repeat = DEFAULT_PERF_REPEAT;
+        let rest: Vec<String> = args.collect();
+        let mut idx = 0usize;
+        while idx < rest.len() {
+            let flag = &rest[idx];
+            let next = rest
+                .get(idx + 1)
+                .unwrap_or_else(|| panic!("missing value for {flag}"));
+            match flag.as_str() {
+                "--path" => path = Some(PathBuf::from(next)),
+                "--iterations" => iterations = next.parse().expect("iterations must be an integer"),
+                "--repeat" => repeat = next.parse().expect("repeat must be an integer"),
+                _ => panic!("unknown perf-file arg: {flag}"),
+            }
+            idx += 2;
+        }
+        let path = path.expect("perf-file mode requires --path FILE");
+        run_single_file_perf(&path, iterations, repeat);
+        return;
+    }
+
     let buf = fs::read(&cmd).expect("read file");
     io::stdout().write_all(&gunzip(&buf)).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{corpus_candidates, gunzip, gzip_via_file, prepare_corpus};
+    use super::{
+        corpus_candidates, gunzip, gzip_via_file, prepare_corpus, prepare_single_file_fixture,
+    };
     use std::{
         collections::BTreeMap,
         env,
@@ -866,6 +1091,30 @@ mod tests {
 
         assert_eq!(snapshot_root, second_snapshot_root);
         assert_eq!(first_inputs, second_inputs);
+
+        fs::remove_dir_all(&root).expect("remove temp root");
+        fs::remove_dir_all(&snapshot_root).expect("remove snapshot root");
+    }
+
+    #[test]
+    fn perf_file_snapshot_reuses_copied_input_across_source_mutations() {
+        let root = unique_temp_path("single-file-root");
+        fs::create_dir_all(&root).expect("create temp root");
+        let source = root.join("large.txt");
+        let input = b"single file snapshot\n".repeat(4096);
+        fs::write(&source, &input).expect("write source");
+
+        let first = prepare_single_file_fixture(&source);
+        let first_input = first.input.clone();
+        let first_compressed = first.compressed.clone();
+        let snapshot_root = first.snapshot_root.clone();
+
+        fs::write(&source, b"mutated live source\n").expect("rewrite source");
+
+        let second = prepare_single_file_fixture(&source);
+        assert_eq!(snapshot_root, second.snapshot_root);
+        assert_eq!(first_input, second.input);
+        assert_eq!(first_compressed, second.compressed);
 
         fs::remove_dir_all(&root).expect("remove temp root");
         fs::remove_dir_all(&snapshot_root).expect("remove snapshot root");
