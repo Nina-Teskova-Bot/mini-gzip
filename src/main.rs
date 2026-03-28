@@ -249,7 +249,7 @@ fn stored(s: &mut State, out: &mut Vec<u8>) {
     }
 }
 
-pub fn inflate(input: &[u8]) -> Vec<u8> {
+pub fn inflate(input: &[u8], output_size: usize) -> Vec<u8> {
     let mut s = State {
         bit_count: 0,
         bit_buffer: 0,
@@ -258,7 +258,7 @@ pub fn inflate(input: &[u8]) -> Vec<u8> {
         next: 0,
         window: [0; MAXDIST],
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(output_size);
     loop {
         let last = s.bits(1);
         match s.bits(2) {
@@ -319,8 +319,17 @@ fn gzip_payload(input: &[u8]) -> &[u8] {
     &input[offset..input.len() - 8]
 }
 
+fn gzip_isize(input: &[u8]) -> usize {
+    u32::from_le_bytes(
+        input[input.len() - 4..]
+            .try_into()
+            .unwrap_or_else(|_| panic!("truncated gzip trailer")),
+    ) as usize
+}
+
 pub fn gunzip(input: &[u8]) -> Vec<u8> {
-    inflate(gzip_payload(input))
+    let payload = gzip_payload(input);
+    inflate(payload, gzip_isize(input))
 }
 
 #[derive(Clone)]
