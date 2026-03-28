@@ -74,11 +74,6 @@ impl<'a> State<'a> {
         val & ((1i32 << need) - 1)
     }
 
-    fn output(&mut self, out: &mut Vec<u8>, c: u8) {
-        out.push(c);
-        self.window[self.next] = c;
-        self.next = (self.next + 1) & (MAXDIST - 1);
-    }
 }
 
 fn decode(s: &mut State, h: &Huffman) -> i32 {
@@ -146,15 +141,20 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) {
     loop {
         let sym = decode(s, lc);
         if sym < 256 {
-            s.output(out, sym as u8);
+            let c = sym as u8;
+            out.push(c);
+            s.window[s.next] = c;
+            s.next = (s.next + 1) & (MAXDIST - 1);
         } else if sym > 256 {
             let idx = (sym - 257) as usize;
             let len = LENS[idx] as i32 + s.bits(LEXT[idx] as i32);
             let dsym = decode(s, dc) as usize;
-            let dist = DISTS[dsym] as u32 + s.bits(DEXT[dsym] as i32) as u32;
+            let dist = DISTS[dsym] as usize + s.bits(DEXT[dsym] as i32) as usize;
             for _ in 0..len {
-                let c = s.window[s.next.wrapping_sub(dist as usize) & (MAXDIST - 1)];
-                s.output(out, c);
+                let c = s.window[s.next.wrapping_sub(dist) & (MAXDIST - 1)];
+                out.push(c);
+                s.window[s.next] = c;
+                s.next = (s.next + 1) & (MAXDIST - 1);
             }
         } else {
             return;
@@ -245,7 +245,9 @@ fn stored(s: &mut State, out: &mut Vec<u8>) {
     s.bits(16);
     for _ in 0..len {
         let c = s.nextbyte();
-        s.output(out, c);
+        out.push(c);
+        s.window[s.next] = c;
+        s.next = (s.next + 1) & (MAXDIST - 1);
     }
 }
 
