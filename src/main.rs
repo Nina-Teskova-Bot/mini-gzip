@@ -1,12 +1,14 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
     ffi::OsStr,
     fs,
+    hash::{Hash, Hasher},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{self, Command},
     sync::OnceLock,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAXBITS: usize = 15;
@@ -34,6 +36,7 @@ const ORDER: [usize; 19] = [
 const DEFAULT_CORPUS_LIMIT: usize = 64;
 const DEFAULT_CORPUS_MAX_BYTES: u64 = 256 * 1024;
 const DEFAULT_PERF_ITERATIONS: usize = 7;
+const PERF_SNAPSHOT_VERSION: u64 = 1;
 const CORPUS_EXTENSIONS: &[&str] = &[
     "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "json", "lock", "md", "py",
     "rs", "sh", "toml", "ts", "txt", "yaml", "yml",
@@ -414,27 +417,151 @@ fn gzip_via_file(path: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn prepare_corpus(root: &Path, limit: usize, max_bytes: u64) -> Vec<CorpusEntry> {
+fn perf_snapshot_dir(root: &Path, limit: usize, max_bytes: u64) -> PathBuf {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    PERF_SNAPSHOT_VERSION.hash(&mut hasher);
+    canonical_root.hash(&mut hasher);
+    limit.hash(&mut hasher);
+    max_bytes.hash(&mut hasher);
+    CORPUS_EXTENSIONS.hash(&mut hasher);
+    PathBuf::from("target")
+        .join("perf-corpus")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+fn perf_snapshot_complete(snapshot_root: &Path) -> bool {
+    snapshot_root.join(".complete").is_file()
+}
+
+fn remove_snapshot_root(snapshot_root: &Path) {
+    if snapshot_root.is_dir() {
+        fs::remove_dir_all(snapshot_root)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", snapshot_root.display()));
+    } else if snapshot_root.exists() {
+        fs::remove_file(snapshot_root)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", snapshot_root.display()));
+    }
+}
+
+fn create_perf_snapshot(root: &Path, snapshot_root: &Path, limit: usize, max_bytes: u64) {
     let paths = corpus_candidates(root, limit, max_bytes);
     assert!(
         !paths.is_empty(),
         "no matching files found under {}",
         root.display()
     );
-    paths
+
+    let snapshot_parent = snapshot_root.parent().expect("snapshot dir parent");
+    fs::create_dir_all(snapshot_parent)
+        .unwrap_or_else(|e| panic!("create {}: {e}", snapshot_parent.display()));
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let snapshot_name = snapshot_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("snapshot dir name");
+    let temp_root =
+        snapshot_parent.join(format!(".{snapshot_name}.tmp-{}-{unique}", process::id()));
+    if temp_root.exists() {
+        remove_snapshot_root(&temp_root);
+    }
+    fs::create_dir_all(&temp_root)
+        .unwrap_or_else(|e| panic!("create {}: {e}", temp_root.display()));
+
+    let mut manifest = format!(
+        "source_root={}\nlimit={limit}\nmax_bytes={max_bytes}\nextensions={}\n",
+        root.display(),
+        CORPUS_EXTENSIONS.join(",")
+    );
+    for path in &paths {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or_else(|_| panic!("{} not under {}", path.display(), root.display()));
+        let snapshot_path = temp_root.join(relative);
+        if let Some(parent) = snapshot_path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
+        }
+        fs::copy(path, &snapshot_path).unwrap_or_else(|e| {
+            panic!(
+                "copy {} -> {}: {e}",
+                path.display(),
+                snapshot_path.display()
+            )
+        });
+        manifest.push_str(&format!("{}\n", relative.display()));
+    }
+
+    let manifest_path = temp_root.join(".manifest");
+    fs::write(&manifest_path, manifest)
+        .unwrap_or_else(|e| panic!("write {}: {e}", manifest_path.display()));
+    let complete_path = temp_root.join(".complete");
+    fs::write(&complete_path, b"")
+        .unwrap_or_else(|e| panic!("write {}: {e}", complete_path.display()));
+
+    match fs::rename(&temp_root, snapshot_root) {
+        Ok(()) => {}
+        Err(_) if perf_snapshot_complete(snapshot_root) => {
+            let _ = fs::remove_dir_all(&temp_root);
+        }
+        Err(err) => panic!(
+            "rename {} -> {}: {err}",
+            temp_root.display(),
+            snapshot_root.display()
+        ),
+    }
+}
+
+fn ensure_perf_snapshot(root: &Path, limit: usize, max_bytes: u64) -> PathBuf {
+    let snapshot_root = perf_snapshot_dir(root, limit, max_bytes);
+    if perf_snapshot_complete(&snapshot_root) {
+        return snapshot_root;
+    }
+    if snapshot_root.exists() {
+        remove_snapshot_root(&snapshot_root);
+    }
+    create_perf_snapshot(root, &snapshot_root, limit, max_bytes);
+    snapshot_root
+}
+
+fn prepare_corpus(root: &Path, limit: usize, max_bytes: u64) -> (Vec<CorpusEntry>, PathBuf) {
+    let snapshot_root = ensure_perf_snapshot(root, limit, max_bytes);
+    let paths = corpus_candidates(&snapshot_root, limit, max_bytes);
+    assert!(
+        !paths.is_empty(),
+        "no matching files found under {}",
+        root.display()
+    );
+    let corpus = paths
         .into_iter()
-        .map(|path| {
-            let input = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let compressed = gzip_via_file(&path, &["-n", "-c"]);
+        .map(|snapshot_path| {
+            let relative = snapshot_path
+                .strip_prefix(&snapshot_root)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{} not under {}",
+                        snapshot_path.display(),
+                        snapshot_root.display()
+                    )
+                });
+            let source_path = root.join(relative);
+            let input = fs::read(&snapshot_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", snapshot_path.display()));
+            let compressed = gzip_via_file(&snapshot_path, &["-n", "-c"]);
             let output = gunzip(&compressed);
-            assert_eq!(output, input, "failed for {}", path.display());
+            assert_eq!(output, input, "failed for {}", source_path.display());
             CorpusEntry {
-                path,
+                path: source_path,
                 input,
                 compressed,
             }
         })
-        .collect()
+        .collect();
+    (corpus, snapshot_root)
 }
 
 fn summarize_runs(runs: &[PerfRun], iterations: usize) -> PerfSummary {
@@ -460,13 +587,14 @@ fn summarize_runs(runs: &[PerfRun], iterations: usize) -> PerfSummary {
 
 fn run_perf_harness(root: &Path, iterations: usize, limit: usize, max_bytes: u64) {
     assert!(iterations > 0, "iterations must be greater than zero");
-    let corpus = prepare_corpus(root, limit, max_bytes);
+    let (corpus, snapshot_root) = prepare_corpus(root, limit, max_bytes);
     let bytes: usize = corpus.iter().map(CorpusEntry::bytes).sum();
     let compressed_bytes: usize = corpus.iter().map(|entry| entry.compressed.len()).sum();
 
     eprintln!(
-        "perf corpus root={} files={} bytes={} compressed_bytes={} iterations={} max_bytes={} extensions={}",
+        "perf corpus root={} snapshot={} files={} bytes={} compressed_bytes={} iterations={} max_bytes={} extensions={}",
         root.display(),
+        snapshot_root.display(),
         corpus.len(),
         bytes,
         compressed_bytes,
@@ -562,7 +690,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{corpus_candidates, gunzip, gzip_via_file};
+    use super::{corpus_candidates, gunzip, gzip_via_file, prepare_corpus};
     use std::{
         collections::BTreeMap,
         env,
@@ -626,6 +754,37 @@ mod tests {
 
         fs::remove_file(&path).expect("remove temp file");
         fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn perf_corpus_snapshot_reuses_copied_inputs_across_source_mutations() {
+        let root = unique_temp_path("snapshot-root");
+        fs::create_dir_all(root.join("nested")).expect("create temp root");
+        let alpha = root.join("nested/alpha.md");
+        let beta = root.join("beta.json");
+        fs::write(&alpha, b"alpha snapshot\n").expect("write alpha");
+        fs::write(&beta, b"{\"value\":1}\n").expect("write beta");
+
+        let (first_corpus, snapshot_root) = prepare_corpus(&root, 10, 1024);
+        let first_inputs: Vec<_> = first_corpus
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.input.clone()))
+            .collect();
+
+        fs::write(&alpha, b"mutated live source\n").expect("rewrite alpha");
+        fs::remove_file(&beta).expect("remove beta");
+
+        let (second_corpus, second_snapshot_root) = prepare_corpus(&root, 10, 1024);
+        let second_inputs: Vec<_> = second_corpus
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.input.clone()))
+            .collect();
+
+        assert_eq!(snapshot_root, second_snapshot_root);
+        assert_eq!(first_inputs, second_inputs);
+
+        fs::remove_dir_all(&root).expect("remove temp root");
+        fs::remove_dir_all(&snapshot_root).expect("remove snapshot root");
     }
 
     #[test]
