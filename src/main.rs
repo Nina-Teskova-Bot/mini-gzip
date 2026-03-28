@@ -41,6 +41,16 @@ const CORPUS_EXTENSIONS: &[&str] = &[
     "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "json", "lock", "md", "py",
     "rs", "sh", "toml", "ts", "txt", "yaml", "yml",
 ];
+const FAST_BITS: usize = 9;
+const FAST_TABLE_SIZE: usize = 1 << FAST_BITS;
+
+#[derive(Clone, Copy)]
+struct FastEntry {
+    symbol: i16,
+    len: u8,
+}
+
+const EMPTY_FAST_ENTRY: FastEntry = FastEntry { symbol: 0, len: 0 };
 
 struct State<'a> {
     bit_count: i32,
@@ -52,6 +62,7 @@ struct State<'a> {
 struct Huffman<'a> {
     count: &'a [i16],
     symbol: &'a [i16],
+    fast: &'a [FastEntry; FAST_TABLE_SIZE],
 }
 
 impl<'a> State<'a> {
@@ -76,6 +87,21 @@ impl<'a> State<'a> {
 }
 
 fn decode(s: &mut State, h: &Huffman) -> i32 {
+    if s.bit_count < FAST_BITS as i32 {
+        while s.bit_count < FAST_BITS as i32 && s.pos < s.input.len() {
+            s.bit_buffer |= (s.nextbyte() as i32) << s.bit_count;
+            s.bit_count += 8;
+        }
+    }
+    if s.bit_count > 0 {
+        let entry = h.fast[(s.bit_buffer as usize) & (FAST_TABLE_SIZE - 1)];
+        if entry.len != 0 && i32::from(entry.len) <= s.bit_count {
+            s.bit_buffer >>= entry.len;
+            s.bit_count -= i32::from(entry.len);
+            return entry.symbol as i32;
+        }
+    }
+
     let (mut bitbuf, mut left) = (s.bit_buffer, s.bit_count);
     let (mut len, mut code, mut first, mut index) = (1, 0, 0, 0);
     let mut next_idx = 1usize;
@@ -136,6 +162,44 @@ fn construct(count: &mut [i16], symbol: &mut [i16], length: &[u16], n: usize) ->
     left
 }
 
+fn build_fast_table(lengths: &[u16], n: usize, fast: &mut [FastEntry; FAST_TABLE_SIZE]) {
+    fast.fill(EMPTY_FAST_ENTRY);
+
+    let mut count = [0u32; MAXBITS + 1];
+    for &len in lengths.iter().take(n) {
+        count[len as usize] += 1;
+    }
+
+    let mut next_code = [0u32; MAXBITS + 1];
+    let mut code = 0u32;
+    for bits in 1..=MAXBITS {
+        code = (code + count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    for (symbol, &len_u16) in lengths.iter().take(n).enumerate() {
+        let len = len_u16 as usize;
+        if len == 0 {
+            continue;
+        }
+        let code = next_code[len];
+        next_code[len] += 1;
+        if len <= FAST_BITS {
+            let reversed = (code.reverse_bits() >> (u32::BITS as usize - len)) as usize;
+            let entry = FastEntry {
+                symbol: symbol as i16,
+                len: len as u8,
+            };
+            let step = 1usize << len;
+            let mut idx = reversed;
+            while idx < FAST_TABLE_SIZE {
+                fast[idx] = entry;
+                idx += step;
+            }
+        }
+    }
+}
+
 fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) {
     loop {
         let sym = decode(s, lc);
@@ -168,27 +232,38 @@ fn fixed(s: &mut State, out: &mut Vec<u8>) {
     static FIXED_TABLES: OnceLock<(
         [i16; MAXBITS + 1],
         [i16; FIXLCODES],
+        [FastEntry; FAST_TABLE_SIZE],
         [i16; MAXBITS + 1],
         [i16; MAXDCODES],
+        [FastEntry; FAST_TABLE_SIZE],
     )> = OnceLock::new();
-    let (lc_cnt, lc_sym, dc_cnt, dc_sym) = FIXED_TABLES.get_or_init(|| {
+    let (lc_cnt, lc_sym, lc_fast, dc_cnt, dc_sym, dc_fast) = FIXED_TABLES.get_or_init(|| {
         let (mut lc_cnt, mut lc_sym) = ([0i16; MAXBITS + 1], [0i16; FIXLCODES]);
         let (mut dc_cnt, mut dc_sym) = ([0i16; MAXBITS + 1], [0i16; MAXDCODES]);
-        let mut lengths = [8u16; FIXLCODES];
-        lengths[144..256].fill(9);
-        lengths[256..280].fill(7);
-        construct(&mut lc_cnt, &mut lc_sym, &lengths, FIXLCODES);
-        lengths[..MAXDCODES].fill(5);
-        construct(&mut dc_cnt, &mut dc_sym, &lengths, MAXDCODES);
-        (lc_cnt, lc_sym, dc_cnt, dc_sym)
+        let (mut lc_fast, mut dc_fast) = (
+            [EMPTY_FAST_ENTRY; FAST_TABLE_SIZE],
+            [EMPTY_FAST_ENTRY; FAST_TABLE_SIZE],
+        );
+        let mut lit_lengths = [8u16; FIXLCODES];
+        lit_lengths[144..256].fill(9);
+        lit_lengths[256..280].fill(7);
+        construct(&mut lc_cnt, &mut lc_sym, &lit_lengths, FIXLCODES);
+        build_fast_table(&lit_lengths, FIXLCODES, &mut lc_fast);
+
+        let dist_lengths = [5u16; MAXDCODES];
+        construct(&mut dc_cnt, &mut dc_sym, &dist_lengths, MAXDCODES);
+        build_fast_table(&dist_lengths, MAXDCODES, &mut dc_fast);
+        (lc_cnt, lc_sym, lc_fast, dc_cnt, dc_sym, dc_fast)
     });
     let lc = Huffman {
         count: lc_cnt,
         symbol: lc_sym,
+        fast: lc_fast,
     };
     let dc = Huffman {
         count: dc_cnt,
         symbol: dc_sym,
+        fast: dc_fast,
     };
     codes(s, out, &lc, &dc)
 }
@@ -204,10 +279,13 @@ fn dynamic(s: &mut State, out: &mut Vec<u8>) {
         lengths[ORDER[i]] = s.bits(3) as u16;
     }
     let (mut lc_cnt, mut lc_sym) = ([0i16; MAXBITS + 1], [0i16; MAXLCODES]);
+    let mut lc_fast = [EMPTY_FAST_ENTRY; FAST_TABLE_SIZE];
     construct(&mut lc_cnt, &mut lc_sym, &lengths, 19);
+    build_fast_table(&lengths, 19, &mut lc_fast);
     let mut lc = Huffman {
         count: &lc_cnt,
         symbol: &lc_sym,
+        fast: &lc_fast,
     };
     let mut idx = 0usize;
     while idx < nlen + ndist {
@@ -227,15 +305,20 @@ fn dynamic(s: &mut State, out: &mut Vec<u8>) {
         }
     }
     construct(&mut lc_cnt, &mut lc_sym, &lengths, nlen);
+    build_fast_table(&lengths, nlen, &mut lc_fast);
     lc = Huffman {
         count: &lc_cnt,
         symbol: &lc_sym,
+        fast: &lc_fast,
     };
     let (mut dc_cnt, mut dc_sym) = ([0i16; MAXBITS + 1], [0i16; MAXDCODES]);
+    let mut dc_fast = [EMPTY_FAST_ENTRY; FAST_TABLE_SIZE];
     construct(&mut dc_cnt, &mut dc_sym, &lengths[nlen..], ndist);
+    build_fast_table(&lengths[nlen..], ndist, &mut dc_fast);
     let dc = Huffman {
         count: &dc_cnt,
         symbol: &dc_sym,
+        fast: &dc_fast,
     };
     codes(s, out, &lc, &dc)
 }
