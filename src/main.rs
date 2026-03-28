@@ -45,6 +45,8 @@ const CORPUS_EXTENSIONS: &[&str] = &[
 ];
 const FAST_BITS: usize = 9;
 const FAST_TABLE_SIZE: usize = 1 << FAST_BITS;
+const WINDOW_SIZE: usize = 32 * 1024;
+const STREAM_FLUSH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 struct FastEntry {
@@ -65,6 +67,184 @@ struct Huffman<'a> {
     count: &'a [i16],
     symbol: &'a [i16],
     fast: &'a [FastEntry; FAST_TABLE_SIZE],
+}
+
+trait InflateOutput {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn copy_from_distance(&mut self, dist: usize, len: usize) -> io::Result<()>;
+    fn len(&self) -> usize;
+
+    fn push_byte(&mut self, byte: u8) -> io::Result<()> {
+        self.write_bytes(std::slice::from_ref(&byte))
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct VecOutput {
+    bytes: Vec<u8>,
+}
+
+impl VecOutput {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl InflateOutput for VecOutput {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn copy_from_distance(&mut self, dist: usize, len: usize) -> io::Result<()> {
+        assert!(
+            dist > 0 && dist <= self.bytes.len(),
+            "invalid backreference distance"
+        );
+        let start = self.bytes.len() - dist;
+        if dist >= len {
+            self.bytes.extend_from_within(start..start + len);
+        } else {
+            let target_len = self.bytes.len() + len;
+            self.bytes.reserve(len);
+            while self.bytes.len() < target_len {
+                let chunk = (self.bytes.len() - start).min(target_len - self.bytes.len());
+                self.bytes.extend_from_within(start..start + chunk);
+            }
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+struct StreamingOutput<'a, W: Write> {
+    writer: &'a mut W,
+    buffer: Vec<u8>,
+    produced: usize,
+}
+
+impl<'a, W: Write> StreamingOutput<'a, W> {
+    fn new(writer: &'a mut W) -> Self {
+        Self {
+            writer,
+            buffer: Vec::with_capacity(WINDOW_SIZE + STREAM_FLUSH_BYTES),
+            produced: 0,
+        }
+    }
+
+    fn flush_oldest(&mut self) -> io::Result<()> {
+        if self.buffer.len() <= WINDOW_SIZE {
+            return Ok(());
+        }
+        let flush_len = self.buffer.len() - WINDOW_SIZE;
+        self.writer.write_all(&self.buffer[..flush_len])?;
+        self.buffer.drain(..flush_len);
+        Ok(())
+    }
+
+    fn flush_if_needed(&mut self) -> io::Result<()> {
+        if self.buffer.len() > WINDOW_SIZE + STREAM_FLUSH_BYTES {
+            self.flush_oldest()?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> InflateOutput for StreamingOutput<'_, W> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.buffer.extend_from_slice(bytes);
+        self.produced += bytes.len();
+        self.flush_if_needed()
+    }
+
+    fn copy_from_distance(&mut self, dist: usize, len: usize) -> io::Result<()> {
+        assert!(
+            dist > 0 && dist <= WINDOW_SIZE && dist <= self.produced,
+            "invalid backreference distance"
+        );
+        assert!(dist <= self.buffer.len(), "invalid backreference distance");
+
+        let start = self.buffer.len() - dist;
+        if dist >= len {
+            self.buffer.extend_from_within(start..start + len);
+        } else {
+            let target_len = self.buffer.len() + len;
+            self.buffer.reserve(len);
+            while self.buffer.len() < target_len {
+                let chunk = (self.buffer.len() - start).min(target_len - self.buffer.len());
+                self.buffer.extend_from_within(start..start + chunk);
+            }
+        }
+        self.produced += len;
+        self.flush_if_needed()
+    }
+
+    fn len(&self) -> usize {
+        self.produced
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.writer.write_all(&self.buffer)?;
+            self.buffer.clear();
+        }
+        self.writer.flush()
+    }
+}
+
+struct ExpectedWriter<'a> {
+    expected: &'a [u8],
+    written: usize,
+}
+
+impl<'a> ExpectedWriter<'a> {
+    fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            written: 0,
+        }
+    }
+
+    fn finish(self) {
+        assert_eq!(
+            self.written,
+            self.expected.len(),
+            "stream output length mismatch"
+        );
+    }
+}
+
+impl Write for ExpectedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let end = self.written + buf.len();
+        let expected = self
+            .expected
+            .get(self.written..end)
+            .unwrap_or_else(|| panic!("stream output exceeded expected length"));
+        assert_eq!(
+            buf, expected,
+            "stream output mismatch at byte {}",
+            self.written
+        );
+        self.written = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> State<'a> {
@@ -202,35 +382,29 @@ fn build_fast_table(lengths: &[u16], n: usize, fast: &mut [FastEntry; FAST_TABLE
     }
 }
 
-fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) {
+fn codes<O: InflateOutput>(
+    s: &mut State,
+    out: &mut O,
+    lc: &Huffman,
+    dc: &Huffman,
+) -> io::Result<()> {
     loop {
         let sym = decode(s, lc);
         if sym < 256 {
-            out.push(sym as u8);
+            out.push_byte(sym as u8)?;
         } else if sym > 256 {
             let idx = (sym - 257) as usize;
             let len = LENS[idx] as usize + s.bits(LEXT[idx] as i32) as usize;
             let dsym = decode(s, dc) as usize;
             let dist = DISTS[dsym] as usize + s.bits(DEXT[dsym] as i32) as usize;
-            assert!(dist <= out.len(), "invalid backreference distance");
-            let start = out.len() - dist;
-            if dist >= len {
-                out.extend_from_within(start..start + len);
-            } else {
-                let target_len = out.len() + len;
-                out.reserve(len);
-                while out.len() < target_len {
-                    let chunk = (out.len() - start).min(target_len - out.len());
-                    out.extend_from_within(start..start + chunk);
-                }
-            }
+            out.copy_from_distance(dist, len)?;
         } else {
-            return;
+            return Ok(());
         }
     }
 }
 
-fn fixed(s: &mut State, out: &mut Vec<u8>) {
+fn fixed<O: InflateOutput>(s: &mut State, out: &mut O) -> io::Result<()> {
     static FIXED_TABLES: OnceLock<(
         [i16; MAXBITS + 1],
         [i16; FIXLCODES],
@@ -270,7 +444,7 @@ fn fixed(s: &mut State, out: &mut Vec<u8>) {
     codes(s, out, &lc, &dc)
 }
 
-fn dynamic(s: &mut State, out: &mut Vec<u8>) {
+fn dynamic<O: InflateOutput>(s: &mut State, out: &mut O) -> io::Result<()> {
     let (nlen, ndist, ncode) = (
         s.bits(5) as usize + 257,
         s.bits(5) as usize + 1,
@@ -325,36 +499,67 @@ fn dynamic(s: &mut State, out: &mut Vec<u8>) {
     codes(s, out, &lc, &dc)
 }
 
-fn stored(s: &mut State, out: &mut Vec<u8>) {
+fn stored<O: InflateOutput>(s: &mut State, out: &mut O) -> io::Result<()> {
     s.bits(s.bit_count);
-    let len = s.bits(16) as u32;
+    let len = s.bits(16) as usize;
     s.bits(16);
-    for _ in 0..len {
-        out.push(s.nextbyte());
-    }
+    let start = s.pos;
+    let end = start + len;
+    let chunk = s
+        .input
+        .get(start..end)
+        .unwrap_or_else(|| panic!("unexpected end of input"));
+    s.pos = end;
+    out.write_bytes(chunk)
 }
 
-pub fn inflate(input: &[u8], output_size: usize) -> Vec<u8> {
+fn inflate_blocks<O: InflateOutput>(input: &[u8], out: &mut O) -> io::Result<()> {
     let mut s = State {
         bit_count: 0,
         bit_buffer: 0,
         input,
         pos: 0,
     };
-    let mut out = Vec::with_capacity(output_size);
     loop {
         let last = s.bits(1);
         match s.bits(2) {
-            0 => stored(&mut s, &mut out),
-            1 => fixed(&mut s, &mut out),
-            2 => dynamic(&mut s, &mut out),
+            0 => stored(&mut s, out)?,
+            1 => fixed(&mut s, out)?,
+            2 => dynamic(&mut s, out)?,
             _ => panic!("invalid block type"),
         }
         if last != 0 {
             break;
         }
     }
-    out
+    Ok(())
+}
+
+pub fn inflate(input: &[u8], output_size: usize) -> Vec<u8> {
+    let mut out = VecOutput::with_capacity(output_size);
+    inflate_blocks(input, &mut out).expect("inflate to vec");
+    assert_eq!(
+        out.len(),
+        output_size,
+        "inflate output size did not match gzip trailer"
+    );
+    out.into_inner()
+}
+
+pub fn inflate_into<W: Write>(
+    input: &[u8],
+    output_size: usize,
+    writer: &mut W,
+) -> io::Result<usize> {
+    let mut out = StreamingOutput::new(writer);
+    inflate_blocks(input, &mut out)?;
+    assert_eq!(
+        out.len(),
+        output_size,
+        "inflate output size did not match gzip trailer"
+    );
+    out.finish()?;
+    Ok(out.len())
 }
 
 fn read_c_string(input: &[u8], offset: &mut usize) {
@@ -413,6 +618,11 @@ fn gzip_isize(input: &[u8]) -> usize {
 pub fn gunzip(input: &[u8]) -> Vec<u8> {
     let payload = gzip_payload(input);
     inflate(payload, gzip_isize(input))
+}
+
+pub fn gunzip_into<W: Write>(input: &[u8], writer: &mut W) -> io::Result<usize> {
+    let payload = gzip_payload(input);
+    inflate_into(payload, gzip_isize(input), writer)
 }
 
 #[derive(Clone)]
@@ -880,18 +1090,13 @@ fn run_single_file_perf(source: &Path, iterations: usize, repeat: usize) {
     let mut runs = Vec::with_capacity(iterations);
     for iteration in 0..iterations {
         let start = Instant::now();
-        let mut sink = io::sink();
         let mut iteration_bytes = 0usize;
         for _ in 0..repeat {
-            let output = gunzip(&fixture.compressed);
-            assert_eq!(
-                output.as_slice(),
-                fixture.input.as_slice(),
-                "failed for {}",
-                fixture.source.display()
-            );
-            sink.write_all(&output).expect("write sink");
-            iteration_bytes += output.len();
+            let mut expected = ExpectedWriter::new(&fixture.input);
+            let output_bytes = gunzip_into(&fixture.compressed, &mut expected)
+                .unwrap_or_else(|e| panic!("stream {}: {e}", fixture.source.display()));
+            expected.finish();
+            iteration_bytes += output_bytes;
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
@@ -932,7 +1137,8 @@ fn main() {
     let Some(cmd) = args.next() else {
         let mut b = Vec::new();
         io::stdin().read_to_end(&mut b).expect("read stdin");
-        io::stdout().write_all(&gunzip(&b)).unwrap();
+        let mut stdout = io::stdout().lock();
+        gunzip_into(&b, &mut stdout).unwrap();
         return;
     };
 
@@ -992,19 +1198,22 @@ fn main() {
     }
 
     let buf = fs::read(&cmd).expect("read file");
-    io::stdout().write_all(&gunzip(&buf)).unwrap();
+    let mut stdout = io::stdout().lock();
+    gunzip_into(&buf, &mut stdout).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        corpus_candidates, gunzip, gzip_via_file, prepare_corpus, prepare_single_file_fixture,
+        corpus_candidates, gunzip, gunzip_into, gzip_via_file, prepare_corpus,
+        prepare_single_file_fixture,
     };
     use std::{
         collections::BTreeMap,
         env,
         ffi::OsStr,
         fs,
+        io::{self, Write},
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -1027,6 +1236,44 @@ mod tests {
         let compressed = gzip_via_file(&path, args);
         fs::remove_file(&path).expect("remove temp input");
         compressed
+    }
+
+    struct ChunkedWriter {
+        chunk_size: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl ChunkedWriter {
+        fn new(chunk_size: usize) -> Self {
+            Self {
+                chunk_size,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ChunkedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let written = buf.len().min(self.chunk_size);
+            self.bytes.extend_from_slice(&buf[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_gunzip_handles_partial_writes() {
+        let input = b"streaming gunzip should preserve overlapping copies\n".repeat(4096);
+        let compressed = gzip_from_bytes("streaming", &input, &["-n", "-9", "-c"]);
+        let mut writer = ChunkedWriter::new(13);
+
+        let written = gunzip_into(&compressed, &mut writer).expect("stream gunzip");
+
+        assert_eq!(written, input.len());
+        assert_eq!(writer.bytes, input);
     }
 
     #[test]
