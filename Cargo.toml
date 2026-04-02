@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[dev-dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+proptest = "1.6"
+tempfile = "3"
+which = "7"
