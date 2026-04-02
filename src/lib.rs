@@ -160,7 +160,7 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) -> Result
             let idx = (sym - 257) as usize;
             let len = LENS[idx] as i32 + s.bits(LEXT[idx] as i32)?;
             let dsym = decode(s, dc)? as usize;
-            let dist = DISTS[dsym] as u32 + s.bits(DEXT[dsym] as i32)? as u32;            // Copy a match from the sliding window.
+            let dist = DISTS[dsym] as u32 + s.bits(DEXT[dsym] as i32)? as u32; // Copy a match from the sliding window.
             // Manually inlining `output()` avoids repeated bounds checks on `window`.
             // (Correctness note: `dist` is always <= MAXDIST by construction.)
             let mut from = s.next.wrapping_sub(dist as usize) & (MAXDIST - 1);
@@ -304,13 +304,21 @@ pub fn inflate_gzip(gz: &[u8]) -> Result<Vec<u8>, Error> {
         offset = offset.checked_add(xlen).ok_or(Error::UnexpectedEof)?;
     }
     if (flg & 0x08) != 0 {
-        let end = gz.get(offset..).ok_or(Error::UnexpectedEof)?
-            .iter().position(|&b| b == 0).ok_or(Error::UnexpectedEof)?;
+        let end = gz
+            .get(offset..)
+            .ok_or(Error::UnexpectedEof)?
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(Error::UnexpectedEof)?;
         offset += end + 1;
     }
     if (flg & 0x10) != 0 {
-        let end = gz.get(offset..).ok_or(Error::UnexpectedEof)?
-            .iter().position(|&b| b == 0).ok_or(Error::UnexpectedEof)?;
+        let end = gz
+            .get(offset..)
+            .ok_or(Error::UnexpectedEof)?
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(Error::UnexpectedEof)?;
         offset += end + 1;
     }
     if (flg & 0x02) != 0 {

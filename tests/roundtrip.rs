@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use proptest::prelude::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
