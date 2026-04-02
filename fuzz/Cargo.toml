@@ -1,0 +1,29 @@
+[package]
+name = "mini-gzip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+[dependencies.mini-gzip]
+path = ".."
+
+[[bin]]
+name = "inflate_gzip"
+path = "fuzz_targets/inflate_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_deflate"
+path = "fuzz_targets/roundtrip_deflate.rs"
+test = false
+doc = false
+bench = false
