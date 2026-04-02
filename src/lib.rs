@@ -160,11 +160,19 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) -> Result
             let idx = (sym - 257) as usize;
             let len = LENS[idx] as i32 + s.bits(LEXT[idx] as i32)?;
             let dsym = decode(s, dc)? as usize;
-            let dist = DISTS[dsym] as u32 + s.bits(DEXT[dsym] as i32)? as u32;
+            let dist = DISTS[dsym] as u32 + s.bits(DEXT[dsym] as i32)? as u32;            // Copy a match from the sliding window.
+            // Manually inlining `output()` avoids repeated bounds checks on `window`.
+            // (Correctness note: `dist` is always <= MAXDIST by construction.)
+            let mut from = s.next.wrapping_sub(dist as usize) & (MAXDIST - 1);
+            let mut next = s.next;
             for _ in 0..len {
-                let c = s.window[s.next.wrapping_sub(dist as usize) & (MAXDIST - 1)];
-                s.output(out, c);
+                let c = s.window[from];
+                out.push(c);
+                s.window[next] = c;
+                next = (next + 1) & (MAXDIST - 1);
+                from = (from + 1) & (MAXDIST - 1);
             }
+            s.next = next;
         } else {
             return Ok(());
         }
