@@ -10,3 +10,8 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 proptest = "1.6"
 tempfile = "3"
 which = "7"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "inflate"
+harness = false
